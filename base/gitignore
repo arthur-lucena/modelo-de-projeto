@@ -1,0 +1,2 @@
+# Configuração local do Claude Code (hooks do ai-memory com caminhos desta máquina).
+/.claude/settings.local.json

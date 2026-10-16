@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# Aplica o modelo de projeto: AGENTS.md com o bloco fixo, skills e ai-memory.
+#
+#   modelo novo <pasta> --projeto <nome> [--nome <título>] [--descricao <frase>] [--secoes <arquivo.md>]
+#   modelo adotar <pasta> [--projeto <nome>] [--aplicar]
+#   modelo atualizar <pasta> [--aplicar]
+#
+# Sem --aplicar, adotar e atualizar só mostram o que mudaria.
+# MODELO_SO_NA_PASTA=1 não registra o MCP nem cria páginas no ai-memory (usado nos testes).
+set -euo pipefail
+
+MODELO_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+BASE="$MODELO_DIR/base"
+SKILLS=${MODELO_SKILLS_CLI:-npx -y skills@1.7.2}
+AI_MEMORY=${AI_MEMORY_BIN:-$(command -v ai-memory || echo "$HOME/.local/bin/ai-memory")}
+AI_MEMORY_DADOS=${AI_MEMORY_DATA_DIR:-$HOME/.local/share/ai-memory}
+AI_MEMORY_CONFIG=${AI_MEMORY_CONFIG:-$HOME/.config/ai-memory/config.toml}
+INICIO='<!-- modelo:inicio'
+FIM='<!-- modelo:fim -->'
+LINHA_GITIGNORE='/.claude/settings.local.json'
+
+erro() { echo "modelo: $*" >&2; exit 1; }
+uso() { sed -n '4,6s/^#   /  /p' "$MODELO_DIR/modelo" >&2; exit 2; }
+
+# O CLI do ai-memory não lê ~/.config/ai-memory/config.toml por conta própria e cai na
+# porta padrão (49374), que nesta máquina é do OpenCode. Por isso o endereço vai explícito.
+url_do_ai_memory() {
+  if [ -n "${AI_MEMORY_SERVER_URL:-}" ]; then echo "$AI_MEMORY_SERVER_URL"; return; fi
+  local bind
+  bind=$(sed -n 's/^bind *= *"\(.*\)"/\1/p' "$AI_MEMORY_CONFIG" 2>/dev/null | head -1)
+  [ -n "$bind" ] || erro "não achei o endereço do ai-memory em $AI_MEMORY_CONFIG; defina AI_MEMORY_SERVER_URL"
+  echo "http://$bind"
+}
+
+# ------------------------------------------------------------------ argumentos
+[ $# -ge 2 ] || uso
+MODO=$1 PASTA=$2
+shift 2
+PROJETO='' NOME='' DESCRICAO='' SECOES='' APLICAR=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --projeto) [ $# -ge 2 ] || uso; PROJETO=$2; shift 2 ;;
+    --nome) [ $# -ge 2 ] || uso; NOME=$2; shift 2 ;;
+    --descricao) [ $# -ge 2 ] || uso; DESCRICAO=$2; shift 2 ;;
+    --secoes) [ $# -ge 2 ] || uso; SECOES=$2; shift 2 ;;
+    --aplicar) APLICAR=1; shift ;;
+    *) uso ;;
+  esac
+done
+case $MODO in novo | adotar | atualizar) ;; *) uso ;; esac
+[ "$MODO" = novo ] && APLICAR=1
+if [ -n "$PROJETO" ] && ! [[ $PROJETO =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  erro "nome de projeto inválido: '$PROJETO' (use minúsculas, números e hífen)"
+fi
+if [ -n "$SECOES" ]; then [ -f "$SECOES" ] || erro "arquivo de seções não existe: $SECOES"; fi
+PASTA=$(realpath -m "$PASTA")
+TRAB=$(mktemp -d)
+trap 'rm -rf "$TRAB"' EXIT
+
+# ------------------------------------------------------------------ ajudantes
+MUDOU=0
+anota() { MUDOU=1; echo "• $*"; }
+
+# faz <descrição> <comando…>: anota e, com --aplicar, executa.
+faz() {
+  local desc=$1; shift
+  anota "$desc"
+  if [ "$APLICAR" = 1 ]; then "$@"; fi
+}
+
+# grava <caminho relativo> <arquivo com o conteúdo novo>: cria ou altera se mudou.
+grava() {
+  local destino="$PASTA/$1" novo=$2
+  if [ -f "$destino" ] && cmp -s "$destino" "$novo"; then return 0; fi
+  if [ -e "$destino" ]; then
+    anota "alterar $1"
+    if [ "$APLICAR" = 0 ]; then
+      diff -u --label "$1 (hoje)" --label "$1 (depois)" "$destino" "$novo" | sed 's/^/    /' || true
+    fi
+  else
+    anota "criar $1"
+    if [ "$APLICAR" = 0 ]; then sed 's/^/    + /' "$novo"; fi
+  fi
+  if [ "$APLICAR" = 1 ]; then
+    mkdir -p "$(dirname "$destino")"
+    cp "$novo" "$destino"
+  fi
+}
+
+# renderiza <modelo> <seções>: troca {{NOME}}, {{DESCRICAO}} e {{PROJETO}};
+# as linhas {{BLOCO}} e {{SECOES}} viram o bloco fixo e as seções do projeto.
+renderiza() {
+  local linha
+  while IFS= read -r linha || [ -n "$linha" ]; do
+    case $linha in
+      '{{BLOCO}}') cat "$BASE/bloco.md" ;;
+      '{{SECOES}}') sed -e '$a\' "$2" ;;
+      *)
+        linha=${linha//'{{NOME}}'/"$NOME"}
+        linha=${linha//'{{DESCRICAO}}'/"$DESCRICAO"}
+        linha=${linha//'{{PROJETO}}'/"$PROJETO"}
+        printf '%s\n' "$linha"
+        ;;
+    esac
+  done < "$1"
+}
+
+tem_bloco() { [ -f "$1" ] && grep -q "^$INICIO" "$1"; }
+
+# insere_bloco <AGENTS.md>: põe o bloco antes da primeira seção "## ", ou no fim.
+insere_bloco() {
+  local linha posto=0
+  while IFS= read -r linha || [ -n "$linha" ]; do
+    if [ $posto = 0 ] && [[ $linha == '## '* ]]; then
+      cat "$BASE/bloco.md"; echo; posto=1
+    fi
+    printf '%s\n' "$linha"
+  done < "$1"
+  if [ $posto = 0 ]; then echo; cat "$BASE/bloco.md"; fi
+}
+
+# troca_bloco <AGENTS.md>: troca o que está entre os marcadores pelo bloco do modelo.
+troca_bloco() {
+  local linha dentro=0
+  while IFS= read -r linha || [ -n "$linha" ]; do
+    if [ $dentro = 0 ] && [[ $linha == "$INICIO"* ]]; then
+      dentro=1; cat "$BASE/bloco.md"; continue
+    fi
+    if [ $dentro = 1 ]; then
+      if [ "$linha" = "$FIM" ]; then dentro=0; fi
+      continue
+    fi
+    printf '%s\n' "$linha"
+  done < "$1"
+  [ $dentro = 0 ] || erro "AGENTS.md tem '$INICIO' sem '$FIM'"
+}
+
+projeto_do_toml() { sed -n 's/^project *= *"\(.*\)"/\1/p' "$PASTA/.ai-memory.toml" | head -1; }
+
+# A pasta precisa ser a raiz do próprio repositório: os hooks vão para a raiz do Git.
+confere_raiz_do_git() {
+  local raiz
+  if raiz=$(git -C "$PASTA" rev-parse --show-toplevel 2>/dev/null); then
+    [ "$(realpath "$raiz")" = "$(realpath "$PASTA")" ] ||
+      erro "$PASTA está dentro do repositório $raiz; rode o modelo na raiz dele"
+  fi
+}
+
+# ------------------------------------------------------------------ arquivos
+arquivos_do_novo() {
+  local secoes=${SECOES:-$BASE/secoes.md}
+  renderiza "$BASE/AGENTS.md" "$secoes" > "$TRAB/AGENTS.md"
+  grava AGENTS.md "$TRAB/AGENTS.md"
+  grava CLAUDE.md "$BASE/CLAUDE.md"
+  renderiza "$BASE/GLOSSARY.md" /dev/null > "$TRAB/GLOSSARY.md"
+  grava GLOSSARY.md "$TRAB/GLOSSARY.md"
+  grava docs/adr/.gitkeep "$BASE/docs/adr/.gitkeep"
+  renderiza "$BASE/ai-memory.toml" /dev/null > "$TRAB/ai-memory.toml"
+  grava .ai-memory.toml "$TRAB/ai-memory.toml"
+  grava .gitignore "$BASE/gitignore"
+  cp "$BASE/skills-lock.json" "$TRAB/skills-lock.json"
+  grava skills-lock.json "$TRAB/skills-lock.json"
+}
+
+arquivos_do_adotar() {
+  if [ -f "$PASTA/AGENTS.md" ]; then
+    if ! tem_bloco "$PASTA/AGENTS.md"; then
+      insere_bloco "$PASTA/AGENTS.md" > "$TRAB/AGENTS.md"
+      grava AGENTS.md "$TRAB/AGENTS.md"
+    fi
+  else
+    renderiza "$BASE/AGENTS.md" "${SECOES:-$BASE/secoes.md}" > "$TRAB/AGENTS.md"
+    grava AGENTS.md "$TRAB/AGENTS.md"
+  fi
+
+  if [ ! -f "$PASTA/CLAUDE.md" ]; then
+    grava CLAUDE.md "$BASE/CLAUDE.md"
+  elif ! grep -qxF '@AGENTS.md' "$PASTA/CLAUDE.md"; then
+    { printf '@AGENTS.md\n\n'; cat "$PASTA/CLAUDE.md"; } > "$TRAB/CLAUDE.md"
+    grava CLAUDE.md "$TRAB/CLAUDE.md"
+  fi
+
+  if [ ! -f "$PASTA/GLOSSARY.md" ] && [ ! -f "$PASTA/GLOSSARY-MAP.md" ]; then
+    renderiza "$BASE/GLOSSARY.md" /dev/null > "$TRAB/GLOSSARY.md"
+    grava GLOSSARY.md "$TRAB/GLOSSARY.md"
+  fi
+  [ -d "$PASTA/docs/adr" ] || grava docs/adr/.gitkeep "$BASE/docs/adr/.gitkeep"
+
+  if [ ! -f "$PASTA/.ai-memory.toml" ]; then
+    renderiza "$BASE/ai-memory.toml" /dev/null > "$TRAB/ai-memory.toml"
+    grava .ai-memory.toml "$TRAB/ai-memory.toml"
+  fi
+
+  if [ ! -f "$PASTA/.gitignore" ]; then
+    grava .gitignore "$BASE/gitignore"
+  elif ! grep -qxF "$LINHA_GITIGNORE" "$PASTA/.gitignore"; then
+    { cat "$PASTA/.gitignore"; [ -z "$(tail -c1 "$PASTA/.gitignore")" ] || echo
+      echo; cat "$BASE/gitignore"; } > "$TRAB/gitignore"
+    grava .gitignore "$TRAB/gitignore"
+  fi
+
+  mescla_lock
+}
+
+# Junta as skills do modelo ao skills-lock.json do projeto. As skills do ai-memory saem
+# do lock: quem as instala e atualiza é o próprio ai-memory.
+mescla_lock() {
+  if [ -f "$PASTA/skills-lock.json" ]; then
+    jq --slurpfile base "$BASE/skills-lock.json" '
+      .skills |= with_entries(select((.key | startswith("ai-memory-")) and .value.sourceType == "local" | not))
+      | .skills = (($base[0].skills + .skills) | to_entries | sort_by(.key) | from_entries)
+    ' "$PASTA/skills-lock.json" > "$TRAB/skills-lock.json"
+  else
+    cp "$BASE/skills-lock.json" "$TRAB/skills-lock.json"
+  fi
+  grava skills-lock.json "$TRAB/skills-lock.json"
+}
+
+# ------------------------------------------------------------------ skills
+skills_remotas() { jq -r '.skills | to_entries[] | select(.value.sourceType != "local") | .key' "$TRAB/skills-lock.json"; }
+
+tem_skill() { [ -f "$PASTA/.agents/skills/$1/SKILL.md" ] || [ -f "$PASTA/.claude/skills/$1/SKILL.md" ]; }
+
+# baixa <nomes…>: baixa do GitHub, numa pasta temporária, as skills do lock com esses nomes.
+# Deixa cada uma em $TRAB/baixadas/.agents/skills/<nome>.
+baixa() {
+  local tmp="$TRAB/baixadas"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  jq '{version, skills: (.skills | with_entries(select(.key as $k | $ARGS.positional | index($k))))}' \
+    --args "$@" < "$TRAB/skills-lock.json" > "$tmp/skills-lock.json"
+  # shellcheck disable=SC2086 # $SKILLS é um comando com argumentos
+  (cd "$tmp" && $SKILLS experimental_install < /dev/null > "$TRAB/skills.log" 2>&1) ||
+    { cat "$TRAB/skills.log" >&2; erro "falhou ao baixar as skills"; }
+  local nome
+  for nome in "$@"; do
+    [ -f "$tmp/.agents/skills/$nome/SKILL.md" ] || { cat "$TRAB/skills.log" >&2; erro "a skill $nome não veio"; }
+  done
+}
+
+instala_baixadas() {
+  local nome
+  baixa "$@"
+  mkdir -p "$PASTA/.agents/skills"
+  for nome in "$@"; do mv "$TRAB/baixadas/.agents/skills/$nome" "$PASTA/.agents/skills/$nome"; done
+}
+
+instala_skills_que_faltam() {
+  local faltam=() nome
+  for nome in $(skills_remotas); do tem_skill "$nome" || faltam+=("$nome"); done
+  if [ ${#faltam[@]} -gt 0 ]; then
+    faz "baixar do GitHub para .agents/skills: ${faltam[*]}" instala_baixadas "${faltam[@]}"
+  fi
+}
+
+# Baixa de novo todas as skills do lock e troca as que mudaram no GitHub.
+atualiza_skills_remotas() {
+  local nomes=() nome mudaram=()
+  for nome in $(skills_remotas); do
+    if [ -f "$PASTA/.agents/skills/$nome/SKILL.md" ]; then nomes+=("$nome"); fi
+  done
+  [ ${#nomes[@]} -gt 0 ] || return 0
+  baixa "${nomes[@]}"
+  for nome in "${nomes[@]}"; do
+    diff -rq "$TRAB/baixadas/.agents/skills/$nome" "$PASTA/.agents/skills/$nome" > /dev/null || mudaram+=("$nome")
+  done
+  for nome in "${mudaram[@]}"; do
+    faz "atualizar a skill $nome com a versão do GitHub" troca_skill "$nome"
+  done
+}
+
+troca_skill() {
+  rm -rf "$PASTA/.agents/skills/$1"
+  mv "$TRAB/baixadas/.agents/skills/$1" "$PASTA/.agents/skills/$1"
+}
+
+mv_skill() { mkdir -p "$PASTA/.agents/skills"; mv "$PASTA/.claude/skills/$1" "$PASTA/.agents/skills/$1"; }
+troca_por_link() { rmdir "$PASTA/.claude/skills"; ln -s ../.agents/skills "$PASTA/.claude/skills"; }
+cria_link() { mkdir -p "$PASTA/.claude"; ln -s ../.agents/skills "$PASTA/.claude/skills"; }
+
+# Uma cópia só das skills, em .agents/skills (lida pelo Codex e pelo OpenCode);
+# .claude/skills vira um link para ela.
+liga_claude_skills() {
+  local dir="$PASTA/.claude/skills" item nome
+  if [ -L "$dir" ]; then
+    [ "$(readlink "$dir")" = "../.agents/skills" ] ||
+      erro ".claude/skills aponta para $(readlink "$dir"); esperava ../.agents/skills"
+    return 0
+  fi
+  if [ ! -d "$dir" ]; then
+    faz "ligar .claude/skills a ../.agents/skills" cria_link
+    return 0
+  fi
+  for item in "$dir"/*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    nome=${item##*/}
+    if [ -L "$item" ]; then
+      [ -e "$PASTA/.agents/skills/$nome" ] || erro ".claude/skills/$nome é um link e não existe em .agents/skills"
+      faz "apagar o link .claude/skills/$nome" rm "$item"
+    elif [ ! -d "$item" ]; then
+      erro "arquivo solto em .claude/skills: $nome"
+    elif [ -e "$PASTA/.agents/skills/$nome" ]; then
+      diff -rq "$item" "$PASTA/.agents/skills/$nome" > /dev/null ||
+        erro "a skill $nome está em .claude/skills e em .agents/skills com conteúdos diferentes"
+      faz "apagar .claude/skills/$nome, igual à de .agents/skills" rm -r "$item"
+    else
+      faz "mover .claude/skills/$nome para .agents/skills/$nome" mv_skill "$nome"
+    fi
+  done
+  faz "trocar a pasta .claude/skills por um link para ../.agents/skills" troca_por_link
+}
+
+instala_skills_do_ai_memory() {
+  (cd "$PASTA" && "$AI_MEMORY" install-skills --scope project --agent agents) > "$TRAB/ai-memory.log" 2>&1 ||
+    { cat "$TRAB/ai-memory.log" >&2; erro "falhou ao instalar as skills do ai-memory"; }
+}
+
+# ------------------------------------------------------------------ ai-memory
+hooks_instalados() {
+  local f="$PASTA/.claude/settings.local.json"
+  [ -f "$f" ] && [ "$(jq --arg u "--server-url $URL" \
+    '[.hooks[]?[]?.hooks[]?.command | select(contains($u))] | length' "$f" 2> /dev/null || echo 0)" -ge 9 ]
+}
+
+instala_hooks() {
+  (cd "$PASTA" && "$AI_MEMORY" install-hooks --agent claude-code --scope project --server-url "$URL" --apply) \
+    > "$TRAB/hooks.log" 2>&1 || { cat "$TRAB/hooks.log" >&2; erro "falhou ao instalar os hooks do ai-memory"; }
+}
+
+registra_mcp() {
+  (cd "$PASTA" && claude mcp add -s local ai-memory -- "$AI_MEMORY" mcp-bridge \
+    --data-dir "$AI_MEMORY_DADOS" --config "$AI_MEMORY_CONFIG" --server-url "$URL") > /dev/null
+}
+
+# search e write-page falam com o servidor; sem AI_MEMORY_SERVER_URL, iriam para a 49374.
+# tem_pagina <pasta> <prefixo>: 0 se o projeto tem página cujo caminho começa com o prefixo.
+# Procura pelo nome da pasta, que entra na busca. Projeto que ainda não existe conta como "não tem".
+tem_pagina() {
+  local saida
+  if ! saida=$(AI_MEMORY_SERVER_URL=$URL "$AI_MEMORY" search --workspace default --project "$PROJETO" \
+    --json "$1" 2> "$TRAB/busca.log"); then
+    grep -q '404 Not Found' "$TRAB/busca.log" && return 1
+    cat "$TRAB/busca.log" >&2
+    erro "não consegui consultar o ai-memory"
+  fi
+  jq -e --arg p "$2" 'any(.[]; .path | startswith($p))' <<< "$saida" > /dev/null
+}
+
+cria_pagina() { # cria_pagina <caminho> <modelo> <tipo> <título>
+  renderiza "$2" /dev/null > "$TRAB/pagina.md"
+  AI_MEMORY_SERVER_URL=$URL "$AI_MEMORY" write-page \
+    --workspace default --project "$PROJETO" --path "$1" --kind "$3" --title "$4" \
+    --body "$(cat "$TRAB/pagina.md")" > "$TRAB/pagina.log" 2>&1 ||
+    { cat "$TRAB/pagina.log" >&2; erro "falhou ao criar $1 no ai-memory"; }
+}
+
+liga_ai_memory() {
+  hooks_instalados || faz "instalar os hooks do ai-memory em .claude/settings.local.json ($URL)" instala_hooks
+  [ "${MODELO_SO_NA_PASTA:-}" = 1 ] && return 0
+
+  if ! command -v claude > /dev/null; then
+    echo "  (claude não encontrado: o MCP do ai-memory não foi registrado no Claude Code)"
+  elif ! (cd "$PASTA" && claude mcp get ai-memory > /dev/null 2>&1); then
+    faz "registrar o MCP ai-memory no Claude Code, escopo local desta pasta" registra_mcp
+  fi
+
+  tem_pagina concepts concepts/ ||
+    faz "criar a página concepts/$PROJETO.md no ai-memory" \
+      cria_pagina "concepts/$PROJETO.md" "$MODELO_DIR/memoria/concepts.md" fact "${NOME}: o projeto hoje"
+  tem_pagina _rules _rules/forma-de-trabalho.md ||
+    faz "criar a página _rules/forma-de-trabalho.md no ai-memory" \
+      cria_pagina _rules/forma-de-trabalho.md "$MODELO_DIR/memoria/forma-de-trabalho.md" rule \
+      "Regras de trabalho no $PROJETO"
+}
+
+# ------------------------------------------------------------------ modos
+case $MODO in
+  novo)
+    [ -n "$PROJETO" ] || erro "falta --projeto"
+    if [ -e "$PASTA" ] && [ -n "$(ls -A "$PASTA" 2> /dev/null)" ]; then
+      erro "$PASTA não está vazia; para um projeto que já existe, use: modelo adotar $PASTA"
+    fi
+    NOME=${NOME:-$PROJETO}
+    DESCRICAO=${DESCRICAO:-<!-- Descreva o projeto em uma frase. -->}
+    URL=$(url_do_ai_memory)
+    mkdir -p "$PASTA"
+    confere_raiz_do_git
+    git -C "$PASTA" rev-parse --git-dir > /dev/null 2>&1 || faz "criar o repositório Git" git -C "$PASTA" init -q -b main
+    arquivos_do_novo
+    liga_claude_skills
+    instala_skills_que_faltam
+    faz "instalar as skills do ai-memory em .agents/skills" instala_skills_do_ai_memory
+    liga_ai_memory
+    ;;
+
+  adotar)
+    [ -d "$PASTA" ] || erro "$PASTA não existe; para começar do zero, use: modelo novo $PASTA"
+    confere_raiz_do_git
+    if [ -f "$PASTA/.ai-memory.toml" ]; then
+      atual=$(projeto_do_toml)
+      [ -z "$PROJETO" ] || [ "$PROJETO" = "$atual" ] ||
+        erro ".ai-memory.toml já aponta para o projeto '$atual', não para '$PROJETO'"
+      PROJETO=$atual
+    fi
+    [ -n "$PROJETO" ] || erro "falta --projeto (a pasta não tem .ai-memory.toml)"
+    NOME=${NOME:-$PROJETO}
+    DESCRICAO=${DESCRICAO:-<!-- Descreva o projeto em uma frase. -->}
+    URL=$(url_do_ai_memory)
+    arquivos_do_adotar
+    liga_claude_skills
+    instala_skills_que_faltam
+    tem_skill ai-memory-retrieval ||
+      faz "instalar as skills do ai-memory em .agents/skills" instala_skills_do_ai_memory
+    liga_ai_memory
+    ;;
+
+  atualizar)
+    tem_bloco "$PASTA/AGENTS.md" || erro "$PASTA/AGENTS.md não tem o bloco do modelo; use: modelo adotar $PASTA"
+    troca_bloco "$PASTA/AGENTS.md" > "$TRAB/AGENTS.md"
+    grava AGENTS.md "$TRAB/AGENTS.md"
+    mescla_lock
+    instala_skills_que_faltam
+    atualiza_skills_remotas
+    if [ "$APLICAR" = 1 ]; then instala_skills_do_ai_memory; fi
+    ;;
+esac
+
+echo
+if [ "$MUDOU" = 0 ]; then
+  echo "Nada a mudar."
+elif [ "$APLICAR" = 0 ]; then
+  echo "Nada foi gravado. Para aplicar: modelo $MODO $PASTA --aplicar"
+elif [ "$MODO" = atualizar ]; then
+  echo "Pronto. Revise com git diff e faça o commit."
+else
+  echo "Pronto. Abra o agente de novo nesta pasta para carregar os hooks e o MCP; depois revise e faça o commit."
+fi

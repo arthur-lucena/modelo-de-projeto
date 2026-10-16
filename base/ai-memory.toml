@@ -1,0 +1,4 @@
+# Projeto deste repositório na memória do ai-memory, o mesmo para todos os agentes
+# (Claude Code, Codex, OpenCode), qualquer que seja a pasta ou o remoto.
+workspace = "default"
+project = "{{PROJETO}}"
