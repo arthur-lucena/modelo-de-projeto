@@ -15,7 +15,7 @@ A skill `novo-projeto` conduz tudo: faz a rodada de perguntas, chama o script e 
 npx -y skills@1.7.2 add ~/Workspace/modelo-de-projeto --skill novo-projeto -g -y -a claude-code codex opencode
 ```
 
-Depois, em qualquer agente: "/novo-projeto", ou "comece um projeto novo com o modelo", "adote o modelo neste projeto", "atualize este projeto com o modelo".
+O comando copia a skill para `~/.agents/skills`: depois de mudar `skills/novo-projeto/`, rode-o de novo. Depois, em qualquer agente: "/novo-projeto", ou "comece um projeto novo com o modelo", "adote o modelo neste projeto", "atualize este projeto com o modelo".
 
 O script também roda sozinho:
 
