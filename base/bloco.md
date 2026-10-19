@@ -18,8 +18,10 @@ Histórico, armadilhas e estado atual ficam no ai-memory (MCP `ai-memory`, proje
 - Decisões em rodadas de perguntas numeradas (Q1, Q2…), cada uma com a sua recomendação (skill `grilling`).
 - TDD com os pontos de teste combinados com o usuário antes de escrever o primeiro teste (skill `tdd`).
 - Quando não se sabe se algo funciona no ambiente real, valide lá antes de construir em cima.
+- Ferramenta que outra sessão vai usar de novo (script de validação, gerador, auxiliar de dados) vai para o repositório, com um ponteiro no `AGENTS.md`; o scratchpad guarda só o descartável.
 - Commits em Conventional Commits, em português, terminando com a linha `Co-Authored-By` do agente. Push só quando o usuário pedir.
 - Release: PR com squash, branch remota mantida e tag anotada `vX.Y.Z` com a mensagem "Versão X.Y.Z: …".
+- Repositório com remoto tem CI que roda, em toda PR, o comando de "Comandos que provam que algo funciona"; quem ainda não tem ganha um na primeira release.
 - Ao fim de cada release, sugira um `/retro`. O que valer para qualquer projeto vira mudança no modelo (`~/Workspace/modelo-de-projeto`), só com o ok do usuário; o resto fica neste arquivo ou em `gotchas/`.
 
 ### Notebook
